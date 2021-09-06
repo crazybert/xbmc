@@ -2,6 +2,7 @@
 
 #include "Buffers/VideoBuffer.h"
 #include "DVDCodecs/Video/DVDVideoCodec.h"
+#include "Interface/TimingConstants.h"
 #include "Process/ProcessInfo.h"
 #include "cores/VideoPlayer/DVDCodecs/DVDFactoryCodec.h"
 #include "cores/VideoSettings.h"
@@ -21,6 +22,7 @@
 #include <atomic>
 #include <cassert>
 #include <cerrno>
+#include <cstdint>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -58,11 +60,11 @@ typedef struct _v4l2_ctrl_video_device_poll
 
 using namespace KODI::NVV4L;
 
-NVV4LCodec::NVV4LCodec(CProcessInfo &processInfo) : CDVDVideoCodec(processInfo), m_dec_dev("/dev/nvhost-nvdec")
+NVV4LCodec::NVV4LCodec(CProcessInfo &processInfo) : 
+  CDVDVideoCodec(processInfo), 
+  m_dec_dev("/dev/nvhost-nvdec") 
 {
-  memset(m_pts, 0, sizeof(m_pts));
-  memset(m_dts, 0, sizeof(m_dts));
-  m_ipts = 0;
+
 };
 
 
@@ -272,10 +274,6 @@ bool NVV4LCodec::AddData(const DemuxPacket &packet)
      m_eos.store(true, std::memory_order_relaxed);
      // send one empty buffer to decoder to indicate end of stream
   
-     m_pts[m_ipts % PTS_MAX] = packet.pts;
-     m_dts[m_ipts % PTS_MAX] = packet.dts;
-     buffer->SetPts(m_ipts++);
-
      buffer->Enqueue();
   }
 
@@ -290,11 +288,10 @@ bool NVV4LCodec::AddData(const DemuxPacket &packet)
   size_t len = m_bitconverter->GetConvertSize();
 
 
-  m_pts[m_ipts % PTS_MAX] = packet.pts;
-  m_dts[m_ipts % PTS_MAX] = packet.dts;
-
-  buffer->SetPts(m_ipts++);
   buffer->write(data, len);
+ 
+  m_dts = packet.pts != DVD_NOPTS_VALUE ? packet.pts : packet.dts; 
+  buffer->SetTimestamp(m_dts);
 
   if (!buffer->Enqueue())
   {
@@ -304,7 +301,7 @@ bool NVV4LCodec::AddData(const DemuxPacket &packet)
 
   if (VERBOSE && CServiceBroker::GetLogging().CanLogComponent(LOGVIDEO))
     CLog::Log(LOGDEBUG, "NVV4LCodec::AddData: enqueued output buffer id:%d pts:%d ptsv:%.3f", buffer->GetId(),
-              buffer->GetPts(), packet.pts);
+              buffer->GetTimeStamp(), packet.pts);
 
   return true;
 };
@@ -315,12 +312,8 @@ void NVV4LCodec::Reset()
   m_coder_control_flag = 0;
 
   m_preroll.store(true, std::memory_order_relaxed);
-
-  memset(m_pts, 0, sizeof(m_pts));
-  memset(m_dts, 0, sizeof(m_dts));
-
-  m_ipts = 0;
   m_flushed = true;
+  m_dts = DVD_NOPTS_VALUE;
 
   StreamOff(V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE);
   StreamOff(V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE);
@@ -384,8 +377,8 @@ CDVDVideoCodec::VCReturn NVV4LCodec::GetPicture(VideoPicture* pVideoPicture)
   pVideoPicture->iRepeatPicture = 0;
   pVideoPicture->color_space = 0; // not relevant for NVRenderer
 
-  pVideoPicture->pts = m_pts[buffer->GetPts() % PTS_MAX];
-  pVideoPicture->dts = m_dts[buffer->GetPts() % PTS_MAX];
+  pVideoPicture->pts = buffer->GetTimeStamp();
+  pVideoPicture->dts = m_dts;
 
   if (m_coder_control_flag & DVD_CODEC_CTRL_DROP) 
   {
@@ -508,7 +501,7 @@ void NVV4LCodec::HandleOutputPool()
   {
     buffer->Release();
     if (VERBOSE && CServiceBroker::GetLogging().CanLogComponent(LOGVIDEO))
-      CLog::Log(LOGDEBUG, "NVV4LCodec::DecoderLoop dequed output buffer id:%d, pts:%d", buffer->GetId(), buffer->GetPts());
+      CLog::Log(LOGDEBUG, "NVV4LCodec::DecoderLoop dequed output buffer id:%d, pts:%f", buffer->GetId(), buffer->GetTimeStamp());
   }
 };
 
@@ -521,8 +514,8 @@ void NVV4LCodec::HandleCapturePool()
       m_pool_capture->Ready(buffer->GetId());
 
       if (VERBOSE && CServiceBroker::GetLogging().CanLogComponent(LOGVIDEO))
-        CLog::Log(LOGDEBUG, "NVV4LCodec::DecoderLoop dequed capture buffer id:%d, pts:%d",
-                  buffer->GetId(), buffer->GetPts());
+        CLog::Log(LOGDEBUG, "NVV4LCodec::DecoderLoop dequed capture buffer id:%d, pts:%f",
+                  buffer->GetId(), buffer->GetTimeStamp());
     }
   }
 };
@@ -555,10 +548,10 @@ void NVV4LCodec::DispatchOutput()
     if (buffer->Enqueue()) {
       m_pool_output->GetReadyBuffer();
       if (VERBOSE && CServiceBroker::GetLogging().CanLogComponent(LOGVIDEO))
-        CLog::Log(LOGDEBUG, "NVV4LCodec::DecoderLoop enqueued output buffer id:%d, pts:%d",
-                  buffer->GetId(), buffer->GetPts());
+        CLog::Log(LOGDEBUG, "NVV4LCodec::DecoderLoop enqueued output buffer id:%d, pts:%f",
+                  buffer->GetId(), buffer->GetTimeStamp());
     } else {
-      CLog::Log(LOGWARNING, "NVV4LCodec::DecoderLoop failed enqueue output buffer id:%d, pts:%d", buffer->GetId(), buffer->GetPts());
+      CLog::Log(LOGWARNING, "NVV4LCodec::DecoderLoop failed enqueue output buffer id:%d, pts:%d", buffer->GetId(), buffer->GetTimeStamp());
       break;
     }
   }
@@ -616,8 +609,8 @@ bool NVV4LCodec::StreamOff(uint32_t type)
 };
 
 
-std::unique_ptr<CDVDVideoCodec> NVV4LCodec::Create(CProcessInfo &processInfo) {
-  return std::make_unique<NVV4LCodec>(processInfo);
+CDVDVideoCodec* NVV4LCodec::Create(CProcessInfo &processInfo) {
+  return new NVV4LCodec(processInfo);
 };
 
 void NVV4LCodec::Register()
@@ -1084,13 +1077,13 @@ void CNVV4LBuffer::GetStrides(int(&strides)[YuvImage::MAX_PLANES])
 };
 
 
-void CNVV4LBuffer::SetPts(size_t pts) {
+void CNVV4LBuffer::SetTimestamp(float pts) {
   m_buffer.flags |= V4L2_BUF_FLAG_TIMESTAMP_COPY;
-  m_buffer.timestamp.tv_sec = pts; 
+  m_buffer.timestamp.tv_sec = DVD_TIME_TO_MSEC(pts);
 };
 
-size_t CNVV4LBuffer::GetPts() {
- return m_buffer.timestamp.tv_sec;
+float CNVV4LBuffer::GetTimeStamp() {
+ return DVD_MSEC_TO_TIME(m_buffer.timestamp.tv_sec);
 };
 
 AVPixelFormat CNVV4LBuffer::GetFormat() 

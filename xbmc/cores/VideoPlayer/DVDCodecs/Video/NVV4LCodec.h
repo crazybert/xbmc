@@ -1,6 +1,7 @@
 #pragma once
 
 #include "DVDVideoCodec.h"
+#include "Interface/TimingConstants.h"
 #include "Process/ProcessInfo.h"
 #include "cores/VideoPlayer/Buffers/VideoBuffer.h"
 #include "cores/VideoPlayer/DVDStreamInfo.h"
@@ -55,15 +56,13 @@ public:
   void Close();
 
   static void Register();
-  static std::unique_ptr<CDVDVideoCodec> Create(CProcessInfo &processInfo);
+  static CDVDVideoCodec* Create(CProcessInfo &processInfo);
 
 private:
   const char* m_dec_dev;
   std::string m_codec;
   std::unique_ptr<CBitstreamConverter> m_bitconverter{nullptr};
-  double m_pts[PTS_MAX];
-  double m_dts[PTS_MAX];
-  size_t m_ipts{0};
+  float m_dts {DVD_NOPTS_VALUE};
 
   uint32_t m_coding_type;
 
@@ -126,8 +125,8 @@ public:
   int write(uint8_t* data, size_t len);
 
 
-  void SetPts(size_t pts);
-  size_t GetPts();
+  void SetTimestamp(float pts);
+  float GetTimeStamp();
 
   int GetId() { return m_id; };
 
